@@ -1,5 +1,5 @@
 ---
-title: PR code review on keyto-hub via open-code-review, hub-native seat relay
+title: PR code review on keyto-hub via open-code-review, with a hub-native seat service (two phases)
 status: draft for review
 date: 2026-09-03
 author: OCR agent, for Sean
@@ -11,7 +11,16 @@ depends_on:
   - keyto-talos-k8s: nothing for v1; project.yaml schema change deferred to v1.1
 ---
 
-# PR code review on keyto-hub, hub-native seat relay
+# PR code review on keyto-hub, hub-native seat relay and seat service
+
+**Phases.** Part I (§1–§10) is Phase 1: reviews running within days on a per-pod
+seat-relay sidecar fed by the hub's existing seat profiles, enough to run the
+twenty-PR eval that decides whether OCR earns its place. Part II (§11–§18) is
+Phase 2: the full seat model borrowed from aios and rebuilt inside the hub with no
+connection to it — enrolment over HTTP, a seat store, revocable per-purpose handles,
+headroom tracking and failover, seat-to-repo assignment, and the admin frontend
+that makes reviews administrable end to end. Everything in Part I except the
+sidecar carries into Part II unchanged.
 
 Every claim below that names a file or function was read from the code on
 2026-09-03. Line numbers are approximate and will drift. Nothing here calls,
@@ -345,3 +354,187 @@ Relation to the hub's Phase 2 plan: the sidecar is the per-pod half of "the Hub 
 | UAT e2e + eval run on 20 PRs | 2 days |
 
 About eleven working days for one engineer, all inside keyto-hub. Nothing is owed by keyto-aios.
+
+---
+
+# Part II — Phase 2: hub-native seat service, assignment and admin UI
+
+## 11. Summary
+
+Replace the per-pod sidecar with a hub-owned **seat service**: one small
+deployment beside `workspace-gateway` that enrols seats over HTTP, stores tokens
+encrypted in Postgres, mints revocable **handles** per purpose, relays
+`/anthropic/*` for any hub pod presenting a handle, tracks per-seat headroom from
+provider headers and the usage endpoint, and fails over inside a pool on 429. The
+hub's Next.js app is the only control plane (session-authenticated routes), so the
+"loopback-only" trick seat-proxy uses is unnecessary: the relay is the only surface
+pods reach. A **seat binding** on each project decides which seat or pool a review
+spends. The admin frontend shows seats, handles, headroom, bindings and jobs.
+
+This is the model documented in `keyto-aios/seat-proxy` and its design docs,
+re-implemented in TypeScript inside keyto-hub. Nothing calls aios. It also
+completes the hub's own lifecycle design Phase 2 ("enrolment needs no pod … the
+Hub reads token expiry and holds the refresh token").
+
+```
+deploy manager ─ hub UI ─▶ Seats: enrol (OAuth PKCE popup) · headroom · handles · revoke
+                          ▶ Project: review settings + seat binding (requester | seat | pool)
+                          ▶ Review PR → review_jobs row → handle minted (label review:<project>#<jobId>)
+review pod ── x-api-key: <handle> ──▶ seat-service /anthropic/v1/messages
+                                        handle → binding → seat (or pool pick by headroom)
+                                        refresh if near expiry · Bearer <token> · beta header · identity block
+                                        ──▶ api.anthropic.com ; record headroom from response headers
+hub ◀── callback (unchanged) ; handle revoked on job completion
+CronJob ─▶ /api/internal/seats/refresh (keep idle refresh tokens alive)
+```
+
+## 12. Decisions
+
+| # | Decision | Reason |
+|---|----------|--------|
+| P1 | Seat service is its own deployment (`seat-service/`, Node 22, no framework), not a Next.js route | Streaming proxy with long-lived upstream connections and a 5-minute read timeout does not belong in the Next.js request lifecycle. Precedent: `workspace-gateway/` is a separate image for the same reason. |
+| P2 | Control plane lives in the hub app; the service exposes **only** `/anthropic/*`, `/healthz`, `/metrics`, and an internal `/admin/*` guarded by `KEYTO_WORKSPACE_INTERNAL_SECRET` | Seat-proxy needs loopback-only guards because it has no session layer. The hub has NextAuth, roles and an audit log; reuse them. Pods can reach the relay path only. |
+| P3 | Tokens in Postgres, encrypted with a platform-lane key (`KEYTO_SEAT_KEK`), not in per-user k8s Secrets | The lifecycle design's open question 1 (Secret vs Key Vault). Postgres gives queryability (bindings, headroom, audit) and one place to rotate; the KEK is the same class of secret as `KEYTO_WORKSPACE_TICKET_SECRET`. Existing `claude-creds-<hash>` profiles are imported once (§17); workspaces keep using them until Phase 3. |
+| P4 | Handles are purpose-scoped and short-lived by default | Seat-proxy's leash pattern (`pod:<project>`, rotation as lifetime). Here: label `review:<project>#<jobId>`, expiry = job deadline, revoked by `completeReview`; `workspace:<project>` reserved for a later workspace migration; `admin:test` for the UI probe. Hashed at rest (sha256), value returned once. |
+| P5 | Seats can be **team-owned**, bound to repos or pooled | This is the point of Phase 2 and it changes the hub's written doctrine in `docs/superpowers/specs/2026-08-11-seat-credential-lifecycle-design.md:91-95` ("one user, one seat … no shared/service seats"). **Recorded as Sean's decision on 2026-09-03:** seats become an administrable team resource the hub spends on a deploy manager's behalf, the same practice the OS already follows. Ownership, per-handle usage and the audit log make it accountable. |
+| P6 | Headroom from provider headers on every response, plus the usage endpoint on demand | Ports `headroom.py` (`anthropic-ratelimit-unified-remaining/limit/reset` → `fraction_left`, `resets_at`; 429 → cooldown = `retry-after` or 60 s) and `usage.py` (`GET https://api.anthropic.com/api/oauth/usage`, windows `five_hour`, `seven_day`, `seven_day_opus`, 5 s per-seat debounce). Pool selection uses `available_fraction(now)`: cooling seats are skipped, past `resets_at` a seat is full again, unknown counts as available. |
+| P7 | Failover is opt-in per pool and only on 429 or a dead seat | Seat-proxy built multi-seat failover but left it dormant; the hub's profiles design also flagged automatic picking as out of scope until usage reporting existed. Phase 2 has usage reporting, so pools enable it explicitly; single-seat bindings keep 429 pass-through. |
+| P8 | Anthropic only in Phase 2 | Codex enrolment requires importing `~/.codex/auth.json` because the device-code endpoint is bot-blocked, and OCR's Responses client is non-streaming against a backend that wants streaming. The schema carries `provider` so OpenAI can be added without migration. |
+
+## 13. Data model (`lib/schema.ts`, migration `0032_seats.sql`)
+
+```ts
+export const seatProviderEnum = pgEnum('seat_provider', ['anthropic', 'openai']);
+export const seatStateEnum = pgEnum('seat_state', ['active', 'reauth_required', 'disabled']);
+
+export const seats = pgTable('seats', {
+  id: serial('id').primaryKey(),
+  provider: seatProviderEnum('provider').notNull(),
+  ownerEmail: text('owner_email').notNull(),          // who enrolled
+  teamOwned: boolean('team_owned').notNull().default(false),
+  label: text('label').notNull(),                     // "sean personal", "platform review seat A"
+  accountEmail: text('account_email'),                // provider profile, display only
+  state: seatStateEnum('state').notNull().default('active'),
+  accessTokenEnc: text('access_token_enc').notNull(), // AES-256-GCM under KEYTO_SEAT_KEK; nonce||ct||tag, base64
+  refreshTokenEnc: text('refresh_token_enc').notNull(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  headroomFraction: real('headroom_fraction'),        // tightest top-level window
+  headroomResetsAt: timestamp('headroom_resets_at', { withTimezone: true }),
+  coolingUntil: timestamp('cooling_until', { withTimezone: true }),
+  usageWindows: jsonb('usage_windows'),               // [{key,label,used_percent,fraction_left,resets_at,model,severity}]
+  usageObservedAt: timestamp('usage_observed_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+}, (t) => ({ ownerIdx: index('seats_owner_idx').on(t.ownerEmail) }));
+
+export const seatPools = pgTable('seat_pools', {
+  id: serial('id').primaryKey(),
+  name: text('name').notNull().unique(),
+  failover: boolean('failover').notNull().default(true),
+  createdBy: text('created_by').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+});
+export const seatPoolMembers = pgTable('seat_pool_members', {
+  poolId: integer('pool_id').notNull().references(() => seatPools.id, { onDelete: 'cascade' }),
+  seatId: integer('seat_id').notNull().references(() => seats.id, { onDelete: 'cascade' }),
+  priority: integer('priority').notNull().default(100),
+}, (t) => ({ pk: primaryKey({ columns: [t.poolId, t.seatId] }) }));
+
+export const seatHandles = pgTable('seat_handles', {
+  id: serial('id').primaryKey(),
+  handleHash: text('handle_hash').notNull().unique(),   // sha256 of the opaque value; value shown once
+  seatId: integer('seat_id').references(() => seats.id, { onDelete: 'cascade' }),
+  poolId: integer('pool_id').references(() => seatPools.id, { onDelete: 'cascade' }),
+  label: text('label').notNull(),                       // review:<project>#<jobId> | workspace:<project> | admin:test
+  purpose: text('purpose').notNull(),                   // 'review' | 'workspace' | 'probe'
+  mintedBy: text('minted_by').notNull(),
+  projectId: integer('project_id').references(() => projects.id, { onDelete: 'set null' }),
+  reviewJobId: integer('review_job_id').references(() => reviewJobs.id, { onDelete: 'set null' }),
+  requests: integer('requests').notNull().default(0),
+  inputTokens: bigint('input_tokens', { mode: 'number' }).notNull().default(0),
+  outputTokens: bigint('output_tokens', { mode: 'number' }).notNull().default(0),
+  lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+  expiresAt: timestamp('expires_at', { withTimezone: true }),   // null = until revoked
+  revokedAt: timestamp('revoked_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+}, (t) => ({ seatIdx: index('seat_handles_seat_idx').on(t.seatId), labelIdx: index('seat_handles_label_idx').on(t.label) }));
+
+export const seatBindings = pgTable('seat_bindings', {
+  projectId: integer('project_id').primaryKey().references(() => projects.id, { onDelete: 'cascade' }),
+  mode: text('mode').notNull(),                         // 'requester' | 'seat' | 'pool' | 'api_key'
+  seatId: integer('seat_id').references(() => seats.id, { onDelete: 'set null' }),
+  poolId: integer('pool_id').references(() => seatPools.id, { onDelete: 'set null' }),
+  updatedBy: text('updated_by').notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+});
+```
+
+`review_jobs` gains `seat_id` and `handle_id`. Exactly one of `seatId`/`poolId` is set on a handle (check constraint). Personal seats (`teamOwned=false`) are visible and bindable only by their owner; team seats by superadmins and project owners.
+
+## 14. Seat service (`keyto-hub/seat-service/`)
+
+Node 22, single process, `node:http`/`node:https`, `pg` for `seat_handles`/`seats`, and the same AES-GCM helper the hub app uses (`lib/seat-crypto.ts`, shared as a small internal package). Image `KEYTO_SEAT_SERVICE_IMAGE`; Service `seat-service.keyto-hub.svc.cluster.local:8890`; env `KEYTO_SEAT_KEK`, `PG*`, `KEYTO_WORKSPACE_INTERNAL_SECRET`.
+
+**Relay `ANY /anthropic/{path}`** (port of `relay.py`):
+
+1. Read the handle from `x-api-key` or `Authorization: Bearer`; hash; look up a non-revoked, non-expired handle. Miss → 401 in Anthropic's `authentication_error` shape with "Your seat handle is invalid or revoked." A pod never learns whether the seat or the handle failed.
+2. Resolve the seat: handle → `seatId`; or `poolId` → members ordered by `priority`, skipping `state != active` and `coolingUntil > now`, preferring the highest `available_fraction(now)`; if every member is cooling → 429 with the earliest `retry-after`.
+3. Ensure the token: if `expiresAt - now < 5 min`, refresh under a per-seat row lock: `POST https://platform.claude.com/v1/oauth/token {grant_type:'refresh_token', refresh_token, client_id:'9d1c250a-e61b-44d9-88ed-5944d1962f5e'}`; 400/401/403 → seat `reauth_required` and the request fails 401 "Seat needs to be reconnected"; other statuses transient with backoff. Persist new tokens encrypted.
+4. Rewrite: strip hop-by-hop and incoming auth; `Authorization: Bearer <access>`; merge `anthropic-beta: oauth-2025-04-20`; body fix-ups exactly as §3.2 step 4 (delete `context_management`; identity system block first). Forward to `https://api.anthropic.com/{path}`, 600 s read timeout, streaming.
+5. On response: parse `anthropic-ratelimit-unified-*` → `headroomFraction`, `headroomResetsAt`; on 429 set `coolingUntil = now + retry-after` (default 60 s); if pool-backed with `failover`, retry once on the next best seat before returning 429. Count `requests`, `lastUsedAt`, and tokens from `usage` when the body is one JSON document (streamed bodies count requests only). Return upstream status and headers minus hop-by-hop. Record `review_jobs.seatId` on the first request of a pool handle.
+
+**Internal `/admin/*`** (bearer `KEYTO_WORKSPACE_INTERNAL_SECRET`, called only by the hub app): `POST /admin/refresh/:seatId`; `POST /admin/usage/:seatId` (calls `GET https://api.anthropic.com/api/oauth/usage` with the seat bearer, 5 s per-seat debounce → 429 with `retry_after`, stores the parsed windows); `POST /admin/probe/:handleId` (one minimal `messages` call for the UI's Test button). Enrolment does **not** pass through the service; the hub app performs the OAuth exchange, so the service holds nothing but the KEK.
+
+**Observability.** `/healthz` (db reachable, active seat count); `/metrics` with `seat_relay_requests_total{seat,status}`, `seat_relay_tokens_total{seat,direction}`, `seat_headroom_fraction{seat}`. Logs carry status codes, byte counts, seat and handle ids, never headers or bodies.
+
+## 15. Control plane in the hub app
+
+**Enrolment** (`lib/seat-enroll.ts`, routes under `app/api/seats/`), porting `oauth.py`: PKCE pair; `GET https://claude.com/cai/oauth/authorize?client_id=…&response_type=code&redirect_uri=<paste-back URI seat-proxy uses>&scope=<same scopes>&code_challenge=…&code_challenge_method=S256&state=…` opened in a popup; the user pastes the code; `POST /api/seats/enroll/complete {state, code}` exchanges at `https://platform.claude.com/v1/oauth/token` with `code_verifier`, encrypts and stores, then triggers one `/admin/usage`. State is single-use and bound to the session. Rate-limited via `takeAiLaneToken`. `teamOwned` may be set only by superadmins.
+
+**Routes** (session via `getServerSession(authOptions)`, roles via `isSuperadmin` / `getProjectRole`):
+
+| Route | Method | Who | Behaviour |
+|---|---|---|---|
+| `/api/seats` | GET | any user | own seats plus team seats the caller may bind; headroom, windows, state, handle counts |
+| `/api/seats/enroll/start`, `/complete` | POST | any user | PKCE flow above |
+| `/api/seats/[id]` | PATCH / DELETE | owner or superadmin | label, `teamOwned`, disable; delete revokes all handles |
+| `/api/seats/[id]/handles` | GET | owner or superadmin | labels, purpose, requests, tokens, last used; never values |
+| `/api/seats/[id]/handles/[hid]` | DELETE | owner or superadmin | revoke |
+| `/api/seats/[id]/usage/refresh` | POST | owner or superadmin | proxies `/admin/usage` |
+| `/api/seat-pools`, `/api/seat-pools/[id]/members` | CRUD | superadmin | pools and members |
+| `/api/projects/[name]/review-config` | GET / PUT | project owner | model, effort, concurrency, budget, severity floor, rules, `binding {mode, seatId \| poolId}`; validates the caller may bind that seat |
+| `/api/internal/seats/refresh` | POST | CronJob bearer | refresh seats within 24 h of expiry and seats idle over 7 days, so refresh tokens stay alive; mark `reauth_required` on rejection |
+
+**`startReview` changes** (replacing §3.3 step 2 and the sidecar): resolve the binding → `requester` uses the requester's own active personal seat; `seat` and `pool` as configured; `api_key` as §4.7. Mint a handle `{label: review:<project>#<jobId>, purpose: 'review', expiresAt: job deadline}`, store its hash, write the value into the per-job secret as `llm_token` with `llm_url = http://seat-service.keyto-hub.svc.cluster.local:8890/anthropic`. The pod carries no seat credential; drop the projected `claude-creds` volume and the sidecar. `completeReview` revokes the handle.
+
+## 16. Frontend
+
+- **Seats** (`/seats` per user; `/admin/seats` for superadmins): provider, label, account, state, `five_hour` and `seven_day` bars from `usageWindows`, reset time, cooling badge, handle count. Actions: Enrol (popup), Refresh usage, Rename, Make team seat, Disable, Remove. A row expands to its handles with purpose, label, requests, tokens, last used, Revoke.
+- **Pools** (superadmin): name, failover toggle, ordered members with live headroom.
+- **Project → Reviews** (owner): review config form (model, effort, concurrency, token budget, severity floor, rules JSON editor with a "which rule wins for this path" preview mirroring `ocr rules check`), **seat binding** selector (My seat / Team seat … / Pool … / API key), Test button (mints an `admin:test` handle, calls `/admin/probe`, revokes). Jobs list from Part I plus the seat that served each job; monthly totals per seat.
+- **Job page**: as §3.10 plus seat and handle, and the 429 count from `retry_report`.
+
+## 17. Migration from Phase 1 and from existing profiles
+
+1. **Import.** On the Seats page, "Import from workspace profile" reads the profile's Claude Code blob from `claude-creds-<hash>` (`claudeAiOauth.{accessToken, refreshToken, expiresAt}`), stores it encrypted as a personal seat, and marks the profile `imported` in its `.meta.json`. Workspaces keep using the Secret until Phase 3, so two parties may refresh one credential in that window; the service refreshes only when a request needs it and writes the refreshed blob back to the Secret as well, so neither side holds a stale refresh token.
+2. **Mode switch.** `KEYTO_REVIEW_SEAT_MODE=sidecar|service` per environment. UAT switches to `service` after the eval has run on the sidecar; the sidecar image is retired after prod switches.
+3. **Phase 3 (not this spec).** Workspace pods take a `workspace:<project>` handle and `ANTHROPIC_BASE_URL` pointing at the seat service, the shape the OS uses for its pods; the per-user Secret becomes a cache.
+
+## 18. Tests, rollout, estimate
+
+**Tests.** `seat-service/`: handle lookup and the two 401 shapes; pool selection by headroom with cooling and reset semantics (port the `headroom.py` cases); refresh under the row lock with rotated and non-rotated refresh tokens; 400/401/403 → `reauth_required`; body fix-ups; streaming pass-through with `retry-after`; one failover per request; token accounting. Hub app: PKCE state single-use and session-bound; binding authorisation (a collaborator cannot bind a team seat, a user cannot bind another's personal seat); `startReview` mints and `completeReview` revokes; internal refresh route; UI route tests as Part I.
+
+**Rollout.** (1) Migration `0032`, KEK in the platform lane, service image, values. (2) Superadmins enrol two team seats and create pool `review-default`. (3) Import personal profiles on demand. (4) UAT `KEYTO_REVIEW_SEAT_MODE=service`; re-run five eval PRs to confirm parity with Phase 1. (5) Project owners bind seats; deploy managers get `can_run_review`. (6) Prod. (7) Update AGENTS.md env vars and the seats doctrine paragraph in the lifecycle design.
+
+**Estimate.**
+
+| Piece | Size |
+|---|---|
+| Schema, crypto helper, migration | 1 day |
+| Seat service: relay, refresh, headroom, pool failover, admin endpoints, tests, image | 4 days |
+| Enrolment flow + seat/pool/handle routes + internal refresh + tests | 3 days |
+| `startReview`/`completeReview` handle integration, mode switch, import | 1.5 days |
+| Frontend: Seats, Pools, Project review config + binding, job page additions | 4 days |
+| UAT parity run, docs | 1.5 days |
+
+About fifteen working days after Phase 1's eleven. Roughly five to six weeks in total for the end-to-end product: repos connected, seats enrolled and bound, reviews run and posted, cost visible per seat and per repo.
