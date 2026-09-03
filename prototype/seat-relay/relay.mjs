@@ -12,6 +12,10 @@
 //                           Default off: on a laptop the refresh token belongs to Claude Code
 //                           and rotating it from here could log the user's CLI out.
 //   RELAY_UPSTREAM          default https://api.anthropic.com
+//   RELAY_LOCAL_TOKEN       if set, every /v1/* and /shutdown request must present it as
+//                           x-api-key or Bearer (this is what ocr sends as OCR_LLM_TOKEN).
+//                           Unset = any loopback caller may relay, and /shutdown is disabled.
+//   RELAY_MAX_BODY_BYTES    request body cap, default 32 MiB (413 above it)
 //
 // Logs carry status codes, byte counts and durations only — never headers or bodies.
 
@@ -29,6 +33,7 @@ export const TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 const REJECTED_TOP_LEVEL = ['context_management'];
 const HOP_BY_HOP = new Set(['host', 'content-length', 'connection', 'keep-alive', 'transfer-encoding', 'upgrade', 'proxy-authorization', 'proxy-connection']);
 const REFRESH_SKEW_MS = 5 * 60 * 1000;
+export const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024;
 
 // ── pure helpers (unit-tested) ─────────────────────────────────────────────
 
@@ -79,6 +84,25 @@ export function rewriteHeaders(incoming, accessToken, upstreamHost) {
   out['anthropic-beta'] = mergeBeta(incoming['anthropic-beta']);
   out.host = upstreamHost;
   return out;
+}
+
+/** Extract the caller's presented credential (x-api-key wins, then Bearer). */
+export function presentedToken(headers) {
+  const k = headers['x-api-key'];
+  if (typeof k === 'string' && k) return k;
+  const a = headers.authorization;
+  if (typeof a === 'string' && a.toLowerCase().startsWith('bearer ')) return a.slice(7).trim();
+  return null;
+}
+
+/** Constant-time check of the presented credential against the configured local token. */
+export function authorized(headers, localToken) {
+  if (!localToken) return true;
+  const got = presentedToken(headers);
+  if (!got || got.length !== localToken.length) return false;
+  let diff = 0;
+  for (let i = 0; i < got.length; i++) diff |= got.charCodeAt(i) ^ localToken.charCodeAt(i);
+  return diff === 0;
 }
 
 export function filterResponseHeaders(headers) {
@@ -141,13 +165,22 @@ function sendError(res, status, type, message) {
   res.end(JSON.stringify({ type: 'error', error: { type: type === 'seat_reauth_required' || type === 'seat_token_expired' ? 'authentication_error' : 'api_error', message, relay: type } }));
 }
 
-function readBody(req) {
-  return new Promise((resolve, reject) => { const chunks = []; req.on('data', (c) => chunks.push(c)); req.on('end', () => resolve(Buffer.concat(chunks))); req.on('error', reject); });
+function readBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = []; let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > maxBytes) { req.destroy(); reject(new RelayError(413, 'body_too_large', `Request body exceeds ${maxBytes} bytes.`)); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
 }
 
 // ── server ─────────────────────────────────────────────────────────────────
 
-export function createServer(store, { upstream = 'https://api.anthropic.com' } = {}) {
+export function createServer(store, { upstream = 'https://api.anthropic.com', localToken = null, maxBodyBytes = DEFAULT_MAX_BODY_BYTES } = {}) {
   const up = new URL(upstream);
   const stats = { requests: 0, byStatus: {}, inputTokens: 0, outputTokens: 0 };
 
@@ -185,9 +218,14 @@ export function createServer(store, { upstream = 'https://api.anthropic.com' } =
     try {
       if (req.method === 'GET' && req.url === '/healthz') { res.writeHead(store.state === 'ready' ? 200 : 503, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ ok: store.state === 'ready', seat: store.state, expiresInMin: Math.round((store.creds.expiresAt - Date.now()) / 60000) })); }
       if (req.method === 'GET' && req.url === '/metrics') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify(stats)); }
-      if (req.method === 'POST' && req.url === '/shutdown') { res.writeHead(200); res.end('bye'); setTimeout(() => process.exit(0), 50); return; }
+      if (req.method === 'POST' && req.url === '/shutdown') {
+        if (!localToken) return sendError(res, 403, 'shutdown_disabled', 'Set RELAY_LOCAL_TOKEN to enable /shutdown.');
+        if (!authorized(req.headers, localToken)) return sendError(res, 401, 'unauthorized', 'Bad relay token.');
+        res.writeHead(200); res.end('bye'); setTimeout(() => process.exit(0), 50); return;
+      }
       if (!req.url.startsWith('/v1/')) return sendError(res, 404, 'not_found', 'Only /v1/* is relayed.');
-      let body = await readBody(req);
+      if (!authorized(req.headers, localToken)) return sendError(res, 401, 'unauthorized', 'Bad relay token.');
+      let body = await readBody(req, maxBodyBytes);
       if (String(req.headers['content-type'] || '').includes('application/json') && body.length) {
         try { body = Buffer.from(JSON.stringify(fixupBody(JSON.parse(body.toString('utf8'))))); } catch { /* forward as-is */ }
       }
@@ -199,5 +237,7 @@ export function createServer(store, { upstream = 'https://api.anthropic.com' } =
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const store = new CredentialStore({ file: process.env.RELAY_CREDENTIALS_FILE, keychainService: process.env.RELAY_KEYCHAIN_SERVICE, allowRefresh: process.env.RELAY_ALLOW_REFRESH === '1' }).load();
   const port = Number(process.env.RELAY_PORT || 8890);
-  createServer(store, { upstream: process.env.RELAY_UPSTREAM }).listen(port, '127.0.0.1', () => log('listening', { port, seat: store.state, allowRefresh: store.allowRefresh, expiresInMin: Math.round((store.creds.expiresAt - Date.now()) / 60000) }));
+  const localToken = process.env.RELAY_LOCAL_TOKEN || null;
+  const maxBodyBytes = Number(process.env.RELAY_MAX_BODY_BYTES) || DEFAULT_MAX_BODY_BYTES;
+  createServer(store, { upstream: process.env.RELAY_UPSTREAM, localToken, maxBodyBytes }).listen(port, '127.0.0.1', () => log('listening', { port, seat: store.state, allowRefresh: store.allowRefresh, authRequired: Boolean(localToken), maxBodyBytes, expiresInMin: Math.round((store.creds.expiresAt - Date.now()) / 60000) }));
 }

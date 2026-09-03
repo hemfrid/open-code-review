@@ -1,7 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { fixupBody, IDENTITY_BLOCK, IDENTITY_TEXT, mergeBeta, needsRefresh, parseCredentials, rewriteHeaders, filterResponseHeaders, OAUTH_BETA } from './relay.mjs';
+import { fixupBody, IDENTITY_BLOCK, IDENTITY_TEXT, mergeBeta, needsRefresh, parseCredentials, rewriteHeaders, filterResponseHeaders, OAUTH_BETA, authorized, presentedToken, DEFAULT_MAX_BODY_BYTES } from './relay.mjs';
+
+test('authorized: no configured token allows any loopback caller; configured token must match exactly', () => {
+  assert.equal(authorized({}, null), true);
+  assert.equal(authorized({ 'x-api-key': 'abc' }, 'abc'), true);
+  assert.equal(authorized({ authorization: 'Bearer abc' }, 'abc'), true);
+  assert.equal(authorized({ 'x-api-key': 'abd' }, 'abc'), false);
+  assert.equal(authorized({ 'x-api-key': 'ab' }, 'abc'), false);
+  assert.equal(authorized({}, 'abc'), false);
+  assert.equal(presentedToken({ 'x-api-key': 'k', authorization: 'Bearer b' }), 'k', 'x-api-key wins, as in seat-proxy');
+  assert.equal(DEFAULT_MAX_BODY_BYTES, 32 * 1024 * 1024);
+});
 
 test('parseCredentials reads the Claude Code blob and rejects other shapes', () => {
   const c = parseCredentials({ claudeAiOauth: { accessToken: 'a', refreshToken: 'r', expiresAt: 123 } });
