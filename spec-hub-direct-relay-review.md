@@ -13,6 +13,24 @@ depends_on:
 
 # PR code review on keyto-hub, hub-native seat relay and seat service
 
+**Implementation status (2026-09-04).** Phase 1 is prototyped in this branch under
+`prototype/`, ready to drop into keyto-hub:
+
+| Piece | Where | Verified here |
+|---|---|---|
+| Seat-relay sidecar (§3.2) | `prototype/seat-relay/relay.mjs` + tests | 7 unit tests pass; live run against a seat needs a human (Keychain read) |
+| Review image (§3.1) | `prototype/review-image/{Dockerfile,review.sh,rule.json,test.sh}` | 24 shim assertions pass (success, ocr failure, moved head → 71, sidecar timeout → 70, API-key lane) |
+| Envelope, post-process seam, poster wrapper (§3.5–§3.7) | `prototype/hub/lib/review/` + vendored `post-review-comments.js` | 13 tests pass incl. fake-Octokit posting |
+| Schema, migration, membership flag (§3.4, S8) | `prototype/hub/lib/schema.review.ts`, `drizzle/0031_review_jobs.sql`, `lib/review-membership.ts` | written against hub conventions; not typechecked here |
+| Orchestration and routes (§3.3, §3.5, §3.9) | `prototype/hub/orchestration/reviews.ts`, `prototype/hub/app/api/...` | written against real hub signatures (see `prototype/hub/README.md`); not typechecked here |
+| Eval runner (§8 step 4) | `prototype/eval/run-eval.sh` | smoke-tested with a fake `ocr` |
+
+Not done and cannot be from this repo: the live seat test, moving files into
+keyto-hub and running `tsc` + vitest there, the values.yaml and CronJob changes,
+images pushed to ACR. `prototype/hub/README.md` carries the drop-in map, the invented
+helpers to review, and one must-do: give `execWorkspacePodRead` a `container`
+parameter so the credential snapshot reads from `seat-relay`.
+
 **Phases.** Part I (§1–§10) is Phase 1: reviews running within days on a per-pod
 seat-relay sidecar fed by the hub's existing seat profiles, enough to run the
 twenty-PR eval that decides whether OCR earns its place. Part II (§11–§18) is
